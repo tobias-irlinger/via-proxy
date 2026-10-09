@@ -11,14 +11,25 @@ services:
       - "127.0.0.1:8081:8081"
     environment:
       PROXY_DOMAIN: ${PROXY_DOMAIN:?PROXY_DOMAIN missing}
-      VIA_PROVIDERS: /etc/via/providers.json
+      VIA_PROVIDERS: /etc/via/config/providers.json
+      VIA_RELOAD_INTERVAL: ${VIA_RELOAD_INTERVAL:-5}
       VIA_LOG_KEY: ${VIA_LOG_KEY:?VIA_LOG_KEY missing}
     volumes:
       - ./nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
       - ./nginx:/etc/via/nginx:ro
       - ./lua:/etc/via/lua:ro
-      - ${VIA_PROVIDERS_FILE:-./providers.json}:/etc/via/providers.json:ro
+      # a directory, not the file: editors replace the file on save and a
+      # single-file bind mount would keep showing the old version
+      - ${VIA_CONFIG_DIR:-./config}:/etc/via/config:ro
       - ${VIA_CERT_DIR:-./certs}:/etc/via/certs:ro
+    healthcheck:
+      # /health also checks oauth2-proxy (its image has no shell for a check)
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /health HTTP/1.0\r\n\r\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
 
   oauth2-proxy:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.12.0
@@ -30,6 +41,7 @@ services:
       OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_APPROVAL_PROMPT: auto
+      OAUTH2_PROXY_SILENCE_PING_LOGGING: "true"
 
       # OIDC at the Shibboleth IdP (OIDC OP plugin)
       OAUTH2_PROXY_PROVIDER: oidc

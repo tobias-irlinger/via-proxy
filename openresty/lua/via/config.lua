@@ -1,4 +1,5 @@
--- Loads providers.json once in init_by_lua and builds the host allowlist.
+-- Loads providers.json in init_by_lua, builds the host allowlist and
+-- reloads it in every worker when the file changes (see watch()).
 local cjson = require "cjson.safe"
 local limits = require "via.limits"
 
@@ -84,14 +85,79 @@ function _M.build(data, proxy_domain)
     return cfg
 end
 
-function _M.init()
-    local path = os.getenv("VIA_PROVIDERS") or "/etc/via/providers.json"
-    local data, err = cjson.decode(read_file(path))
+local function path()
+    return os.getenv("VIA_PROVIDERS") or "/etc/via/config/providers.json"
+end
+
+-- Parses and validates the file content. Returns cfg or nil, error.
+local function load(text)
+    local data, err = cjson.decode(text)
     if not data then
-        error("cannot parse " .. path .. ": " .. err)
+        return nil, "cannot parse " .. path() .. ": " .. err
     end
-    _M.current = _M.build(data, os.getenv("PROXY_DOMAIN"))
-    _M.current.log_key = os.getenv("VIA_LOG_KEY") or ""
+    local ok, cfg = pcall(_M.build, data, os.getenv("PROXY_DOMAIN"))
+    if not ok then
+        return nil, "invalid " .. path() .. ": " .. tostring(cfg)
+    end
+    cfg.log_key = os.getenv("VIA_LOG_KEY") or ""
+    cfg.source = text
+    cfg.version = ngx.md5(text):sub(1, 12)
+    cfg.loaded_at = ngx.now()
+    return cfg
+end
+
+-- init_by_lua: a broken file stops nginx from starting (or a reload from
+-- being applied), so mistakes show up immediately.
+function _M.init()
+    local cfg, err = load(read_file(path()))
+    if not cfg then
+        error(err)
+    end
+    _M.current = cfg
+end
+
+-- Re-reads the file if its content changed. A broken file is logged and
+-- ignored, the previous configuration stays active.
+function _M.reload_if_changed()
+    local fh = io.open(path(), "r")
+    if not fh then
+        ngx.log(ngx.ERR, "via-config: cannot read ", path())
+        return false
+    end
+    local text = fh:read("*a")
+    fh:close()
+    if text == _M.current.source then
+        return false
+    end
+    local cfg, err = load(text)
+    if not cfg then
+        ngx.log(ngx.ERR, "via-config: keeping version ", _M.current.version, ": ", err)
+        _M.current.source = text   -- do not log the same error every interval
+        _M.last_error = err
+        return false
+    end
+    _M.current = cfg
+    _M.last_error = nil
+    ngx.log(ngx.NOTICE, "via-config: loaded version ", cfg.version, " with ",
+            #cfg.providers, " providers")
+    return true
+end
+
+-- init_worker_by_lua: poll the file every VIA_RELOAD_INTERVAL seconds
+-- (default 5, 0 disables). Each worker keeps its own copy.
+function _M.watch()
+    local interval = tonumber(os.getenv("VIA_RELOAD_INTERVAL") or "5") or 5
+    if interval <= 0 then
+        return
+    end
+    local ok, err = ngx.timer.every(interval, function(premature)
+        if not premature then
+            _M.reload_if_changed()
+        end
+    end)
+    if not ok then
+        ngx.log(ngx.ERR, "via-config: cannot start watcher: ", err)
+    end
 end
 
 -- Returns the provider responsible for an original host, or nil.

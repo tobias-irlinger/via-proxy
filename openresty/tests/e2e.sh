@@ -3,7 +3,7 @@
 #   tests/e2e.sh          start stack, run tests, stop stack
 #   KEEP=1 tests/e2e.sh   leave the stack running afterwards
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 compose() {
     docker compose --env-file tests/test.env \
@@ -18,6 +18,9 @@ cleanup() {
 trap cleanup EXIT
 
 [ -f certs/fullchain.pem ] || scripts/dev-cert.sh proxy.test
+# work on a copy of the provider config so the reload test can change it
+cp -r tests/config "$work/config"
+export VIA_CONFIG_DIR=$work/config
 compose up -d >/dev/null 2>&1 || { echo "compose up failed"; exit 1; }
 
 PUB=www-example--publisher-test.proxy.test
@@ -47,11 +50,11 @@ check() {   # check <description> <command...>
 has() { grep -qF -- "$2" <<<"$1"; }
 hasnt() { ! grep -qF -- "$2" <<<"$1"; }
 
-# wait until oauth2-proxy has finished OIDC discovery
-for _ in $(seq 60); do
-    jar=/dev/null
-    code=$(c -o /dev/null -w '%{http_code}' https://login.proxy.test/oauth2/start)
-    [ "$code" = 302 ] && break
+admin() { curl -s --noproxy '*' "$@"; }
+
+# wait until /health reports oauth2-proxy ready (OIDC discovery done)
+for _ in $(seq 90); do
+    [ "$(admin http://127.0.0.1:8081/health)" = ok ] && break
     sleep 1
 done
 
@@ -69,6 +72,19 @@ login() {
 
 jar=$work/alice
 target="https://$PUB/echo?a=1&b=2"
+
+# health and status
+r=$(c -w '%{http_code}' https://login.proxy.test/health)
+check "public /health" test "$r" = $'ok\n200'
+r=$(admin http://127.0.0.1:8081/status)
+check "admin /status reports config" has "$r" '"providers":1'
+version=$(sed -n 's/.*"version":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
+for _ in $(seq 30); do
+    health=$(docker inspect --format '{{.State.Health.Status}}' "$(compose ps -q openresty)")
+    [ "$health" = healthy ] && break
+    sleep 1
+done
+check "docker healthcheck healthy" has "$health" "healthy"
 
 r=$(c -o /dev/null -w '%{http_code} %{redirect_url}' \
     "https://login.proxy.test/login?url=https://www.example-publisher.test/echo?a=1&b=2")
@@ -122,8 +138,7 @@ check "non-member is rejected at login" has "$r" "403"
 r=$(c -o /dev/null -w '%{http_code}' "$target")
 check "non-member gets no session" has "$r" "302"
 
-# usage limits (tests/providers.test.json: 3 downloads or 1 MB per hour)
-admin() { curl -s --noproxy '*' "$@"; }
+# usage limits (tests/config/providers.json: 3 downloads or 1 MB per hour)
 jar=$work/carol
 login carol member@example.org "https://$PUB/echo" >/dev/null
 for i in 1 2 3; do
@@ -158,9 +173,49 @@ jar=$work/alice
 r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
 check "other users unaffected" has "$r" "200"
 
+# reload providers.json without restart (replaced like an editor does)
+wait_version() {   # wait_version <old version>: prints new /status
+    local r
+    for _ in $(seq 20); do
+        r=$(admin http://127.0.0.1:8081/status)
+        has "$r" "\"version\":\"$1\"" || { echo "$r"; return; }
+        sleep 0.5
+    done
+    echo "$r"
+}
+r=$(c -o /dev/null -w '%{http_code}' "https://login.proxy.test/login?url=https://www.extra.test/")
+check "new provider unknown before reload" has "$r" "403"
+python3 - "$work/config/providers.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["providers"].append({"id": "extra", "name": "Extra", "hosts": ["www.extra.test"]})
+json.dump(d, open(p + ".tmp", "w"), indent=2)
+PY
+mv "$work/config/providers.json.tmp" "$work/config/providers.json"
+r=$(wait_version "$version")
+check "reload picked up new file" has "$r" '"providers":2'
+new_version=$(sed -n 's/.*"version":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
+sleep 2   # every worker polls on its own
+for i in 1 2 3 4; do
+    r=$(c -o /dev/null -w '%{http_code} %{redirect_url}' "https://login.proxy.test/login?url=https://www.extra.test/x")
+    check "new provider active after reload ($i)" has "$r" "302 https://www-extra-test.proxy.test/x"
+done
+echo '{ broken' > "$work/config/providers.json.tmp"
+mv "$work/config/providers.json.tmp" "$work/config/providers.json"
+sleep 2
+r=$(admin http://127.0.0.1:8081/status)
+check "broken file keeps old config" has "$r" "\"version\":\"$new_version\""
+check "broken file reported in status" has "$r" "cannot parse"
+r=$(c -o /dev/null -w '%{http_code}' "https://login.proxy.test/login?url=https://www.extra.test/")
+check "proxy keeps working with broken file" has "$r" "302"
+
 logs=$(compose logs openresty 2>/dev/null)
 check "block is logged with pseudonym" has "$logs" "via-limit: user $user blocked"
 check "access log has no plain user id" hasnt "$logs" "alice"
 
 echo "$((total - fail))/$total passed"
+if [ "$fail" != 0 ] && [ -n "${CI:-}" ]; then
+    compose logs --no-color
+fi
 [ "$fail" = 0 ]

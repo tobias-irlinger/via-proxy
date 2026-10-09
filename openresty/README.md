@@ -24,7 +24,7 @@ Antwort: Links, Redirects, Cookies werden auf *.proxy.example.org umgeschrieben
 | Funktion | Umsetzung |
 |---|---|
 | Hostnamen | EZproxy-Schema: `.` → `-`, `-` → `--` (`www.some-site.co.uk` → `www-some--site-co-uk.<domain>`). Ein Wildcard-Zertifikat `*.<domain>` reicht. |
-| Anbieter | eine Datei [`providers.json`](providers.json); nur dort gelistete Hosts werden geproxyt (Allowlist), `.example.com` erlaubt alle Subdomains |
+| Anbieter | eine Datei [`config/providers.json`](config/providers.json), Änderungen werden ohne Neustart übernommen; nur dort gelistete Hosts werden geproxyt (Allowlist), `.example.com` erlaubt alle Subdomains |
 | Starting-Point-URL | `https://login.<domain>/login?url=<URL>` (auch `qurl=`), kompatibel zu EZproxy-Links aus Discovery/Linkresolver: dort nur das Präfix tauschen |
 | Login | OIDC (Authorization Code + PKCE) am Shibboleth-IdP; ein Session-Cookie für `.<domain>`, also einmal anmelden für alle Anbieter |
 | Berechtigung | nur Werte aus `eduperson_scoped_affiliation`, die in `ALLOWED_AFFILIATIONS` stehen (z. B. `member@…`) |
@@ -42,13 +42,14 @@ Antwort: Links, Redirects, Cookies werden auf *.proxy.example.org umgeschrieben
 openresty/
 ├── docker-compose.yml       OpenResty + oauth2-proxy
 ├── .env.example             Konfiguration (Domain, IdP, Secrets)
-├── providers.json           Anbieterliste (Beispiele, ungetestet)
+├── config/providers.json    Anbieterliste und Limits (Beispiele, ungetestet)
 ├── nginx/
 │   ├── nginx.conf           server-Blöcke: login.<domain> und *.<domain>
 │   ├── campus.conf          IP-Bereiche für den Campus-Bypass
 │   └── resolver.conf        DNS-Resolver für die Anbieter
 ├── lua/via/
-│   ├── config.lua           lädt providers.json, Host-Allowlist
+│   ├── config.lua           lädt providers.json, Host-Allowlist, Hot-Reload
+│   ├── health.lua           /health und /status
 │   ├── hostmap.lua          Host <-> Proxy-Host
 │   ├── rewrite.lua          URL-, Cookie- und Body-Rewriting
 │   ├── handler.lua          Request-Phasen der Anbieter-Hosts
@@ -86,15 +87,32 @@ openresty/
   die das allgemeine URL-Rewriting nicht erfasst, z. B. Hostnamen ohne Schema
   in JavaScript. `{proxy_domain}` wird ersetzt.
 
-Änderungen an `providers.json` werden mit `docker compose restart openresty`
-(oder `openresty -s reload`) aktiv.
+Änderungen an `config/providers.json` übernimmt der Proxy ohne Neustart:
+Jeder nginx-Worker prüft die Datei alle `VIA_RELOAD_INTERVAL` Sekunden
+(Standard 5) und lädt sie bei Änderungen neu. Eine fehlerhafte Datei (kaputtes
+JSON, doppelter Host, ungültige `id` …) wird **nicht** übernommen: Die
+bisherige Konfiguration bleibt aktiv, der Fehler steht im Log
+(`via-config: keeping version …`) und unter `/status`. Welche Version aktiv
+ist, zeigt:
+
+```sh
+curl http://127.0.0.1:8081/status
+# {"status":"ok","config":{"version":"3f2a…","providers":42,"last_error":null,…},…}
+```
+
+Eingebunden wird das Verzeichnis `config/`, nicht die einzelne Datei: Editoren
+ersetzen die Datei beim Speichern, und ein Einzeldatei-Mount in Docker würde
+weiter die alte Version zeigen. Änderungen an `nginx/*.conf` (z. B.
+Campus-Netze) brauchen weiterhin
+`docker compose exec openresty openresty -s reload`. Ein Reload mit fehlerhafter
+Konfiguration wird von nginx verworfen, die laufende Instanz bleibt aktiv.
 
 ## Download-Limits
 
 Anbieter sperren bei systematischem Herunterladen meist die IP des Proxys,
 also den Zugang für alle. Wie EZproxys `UsageLimit` zählt der Proxy deshalb
 pro Nutzer und sperrt auffällige Kennungen vorübergehend. Konfiguriert wird das
-in `providers.json`:
+in `config/providers.json`:
 
 ```json
 "limits": {
@@ -140,6 +158,19 @@ Zähler und Sperren liegen im Arbeitsspeicher (`lua_shared_dict`). Sie gelten
 also pro Server und gehen bei einem Neustart verloren, ein Reload behält sie.
 Für mehrere Proxy-Server müsste der Zustand nach Redis.
 
+## Betrieb: Health und Status
+
+| Endpunkt | Erreichbar | Inhalt |
+|---|---|---|
+| `https://login.<domain>/health` | öffentlich | `ok` (200) oder `unavailable` (503); prüft auch, ob oauth2-proxy antwortet. Für externes Monitoring |
+| `http://127.0.0.1:8081/health` | nur Server | dasselbe, nutzt der Docker-Healthcheck |
+| `http://127.0.0.1:8081/status` | nur Server | JSON: geladene Konfigurationsversion, Anzahl Anbieter, letzter Ladefehler |
+
+`docker compose ps` zeigt den OpenResty-Container erst als `healthy`, wenn auch
+oauth2-proxy bereit ist (OIDC-Discovery am IdP erfolgreich). Das
+oauth2-proxy-Image hat keine Shell für einen eigenen Healthcheck, deshalb prüft
+OpenResty es mit.
+
 ## Einrichtung
 
 1. **DNS**: `*.proxy.example.org` (und `login.proxy.example.org`) auf den Server.
@@ -169,14 +200,20 @@ Für Discovery/Linkresolver das bisherige EZproxy-Präfix
 
 ```sh
 tests/unit.sh     # Lua-Unit-Tests (54 Fälle)
-tests/e2e.sh      # kompletter Ablauf mit Docker (40 Fälle), DEBUG=1 für Details
+tests/e2e.sh      # kompletter Ablauf mit Docker (52 Fälle), DEBUG=1 für Details
 ```
 
 `e2e.sh` startet zusätzlich einen Mock-OIDC-IdP
 (navikt/mock-oauth2-server) und einen simulierten Verlag mit zwei Hosts und
 prüft u. a. Login, Ablehnung von Nicht-Mitgliedern, URL-, Header- und
-Cookie-Rewriting, Download- und Volumen-Limits inkl. Admin-API sowie dass weder das SSO-Cookie noch Klarnamen nach außen
+Cookie-Rewriting, Download- und Volumen-Limits inkl. Admin-API, Health- und
+Status-Endpunkte, Docker-Healthcheck, Hot-Reload der Anbieterliste (auch mit
+fehlerhafter Datei) sowie dass weder das SSO-Cookie noch Klarnamen nach außen
 bzw. ins Log gelangen.
+
+Die CI ([`.github/workflows/openresty.yml`](../.github/workflows/openresty.yml))
+führt bei jedem Push und Pull Request, der `openresty/` betrifft, shellcheck,
+eine JSON-Prüfung, die Unit-Tests und die End-to-End-Tests aus.
 
 ## Bekannte Grenzen / nächste Schritte
 
