@@ -1,6 +1,8 @@
 -- Per-user usage limits (like EZproxy's UsageLimit): document downloads and
--- transferred bytes in a sliding window. Exceeding a limit blocks the user
--- for a fixed time. Users are identified by their log pseudonym only.
+-- transferred bytes in a sliding window, globally and optionally per
+-- provider. Exceeding a limit blocks the user for a fixed time (a provider
+-- limit only for that provider). Users are identified by their log
+-- pseudonym only.
 --
 -- State lives in lua_shared_dict via_limits, i.e. per server. With several
 -- proxy servers behind a load balancer this would move to Redis.
@@ -20,19 +22,64 @@ local function dict()
 end
 
 -- Turns the "limits" object of providers.json into the runtime config.
-function _M.build(l, set_of)
+-- `inherit` supplies defaults (window, block, contact, download_types)
+-- for provider-level limits.
+function _M.build(l, set_of, inherit)
     if not l or l.enabled == false then
         return nil
     end
+    inherit = inherit or {}
     assert(l.max_downloads or l.max_mb, "limits: max_downloads or max_mb required")
     return {
-        window = l.window or 3600,
+        window = l.window or inherit.window or 3600,
         max_downloads = l.max_downloads,
         max_bytes = l.max_mb and l.max_mb * 1024 * 1024,
-        block = l.block or 3600,
-        contact = l.contact,
-        download_types = set_of(l.download_types or _M.DEFAULT_DOWNLOAD_TYPES),
+        block = l.block or inherit.block or 3600,
+        contact = l.contact or inherit.contact,
+        download_types = l.download_types and set_of(l.download_types)
+            or inherit.download_types or set_of(_M.DEFAULT_DOWNLOAD_TYPES),
     }
+end
+
+-- "limits" of one provider:
+--   absent  -> only the global limits apply
+--   false   -> the provider is not counted at all (e.g. DOI resolver)
+--   {...}   -> own counters and thresholds for this provider, in addition
+--              to the global limits; a block only affects this provider
+function _M.build_provider(l, global, set_of)
+    if l == nil then
+        return nil
+    end
+    if l == false then
+        return false
+    end
+    assert(type(l) == "table", "provider limits must be false or an object")
+    return _M.build(l, set_of, global)
+end
+
+-- The limits that apply to a request: list of { limits, key } where key is
+-- the counter key for the user ("<user>" or "<user>@<provider>").
+function _M.rules(cfg, provider, user)
+    local rules = {}
+    if cfg.limits and provider.limits ~= false then
+        rules[#rules + 1] = { limits = cfg.limits, key = user }
+    end
+    if type(provider.limits) == "table" then
+        rules[#rules + 1] = { limits = provider.limits, key = user .. "@" .. provider.id }
+    end
+    return rules
+end
+
+function _M.enabled(cfg)
+    if cfg.limits then
+        return true
+    end
+    for _, p in ipairs(cfg.providers) do
+        if type(p.limits) == "table" then
+            return true
+        end
+    end
+    return false
 end
 
 -- Sliding window approximation from two fixed windows: the previous window
@@ -107,20 +154,52 @@ function _M.record(limits, user, bytes, download, now)
     return downloads, volume
 end
 
-function _M.unblock(limits, user, now)
-    local existed = dict():get("block:" .. user) ~= nil
-    dict():delete("block:" .. user)
-    reset(user, limits.window, now)
+-- Lifts the global block and all provider blocks of a user.
+function _M.unblock(cfg, user, now)
+    local d = dict()
+    local existed = false
+    for _, key in ipairs(d:get_keys(0)) do
+        if key == "block:" .. user or key:sub(1, #user + 7) == "block:" .. user .. "@" then
+            existed = true
+            d:delete(key)
+        end
+    end
+    if cfg.limits then
+        reset(user, cfg.limits.window, now)
+    end
+    for _, p in ipairs(cfg.providers) do
+        if type(p.limits) == "table" then
+            reset(user .. "@" .. p.id, p.limits.window, now)
+        end
+    end
     return existed
+end
+
+local function counters(limits, key, now)
+    local reason, ttl = _M.blocked(key)
+    return {
+        downloads = count(key .. ":d", limits.window, now, 0),
+        mb = count(key .. ":b", limits.window, now, 0) / 1048576,
+        blocked = reason or false,
+        blocked_seconds_left = ttl,
+    }
+end
+
+local function describe(limits)
+    return {
+        window = limits.window, max_downloads = limits.max_downloads,
+        max_mb = limits.max_bytes and limits.max_bytes / 1048576,
+        block = limits.block,
+    }
 end
 
 -- Admin API on the local-only port (see nginx.conf):
 --   GET  /limits               blocked users
 --   GET  /limits?user=<id>     current counters of one user
---   POST /limits?unblock=<id>  lift a block
-function _M.admin(limits)
+--   POST /limits?unblock=<id>  lift all blocks of a user
+function _M.admin(cfg)
     ngx.header["Content-Type"] = "application/json"
-    if not limits then
+    if not _M.enabled(cfg) then
         ngx.status = 404
         return ngx.say(cjson.encode({ error = "limits disabled" }))
     end
@@ -132,39 +211,50 @@ function _M.admin(limits)
             ngx.status = 405
             return ngx.say(cjson.encode({ error = "use POST" }))
         end
-        local existed = _M.unblock(limits, args.unblock, now)
+        local existed = _M.unblock(cfg, args.unblock, now)
         ngx.log(ngx.WARN, "via-limit: user ", args.unblock, " unblocked by admin")
         return ngx.say(cjson.encode({ user = args.unblock, unblocked = existed }))
     end
 
     if args.user then
-        local reason, ttl = _M.blocked(args.user)
-        return ngx.say(cjson.encode({
-            user = args.user,
-            downloads = count(args.user .. ":d", limits.window, now, 0),
-            mb = count(args.user .. ":b", limits.window, now, 0) / 1048576,
-            blocked = reason or false,
-            blocked_seconds_left = ttl,
-        }))
+        local out = { user = args.user, providers = {} }
+        if cfg.limits then
+            out.global = counters(cfg.limits, args.user, now)
+        end
+        for _, p in ipairs(cfg.providers) do
+            if type(p.limits) == "table" then
+                out.providers[p.id] = counters(p.limits, args.user .. "@" .. p.id, now)
+            end
+        end
+        return ngx.say(cjson.encode(out))
     end
 
     local blocked = {}
     for _, key in ipairs(dict():get_keys(0)) do
-        local user = key:match("^block:(.+)$")
-        if user then
-            local reason, ttl = _M.blocked(user)
+        local subject = key:match("^block:(.+)$")
+        if subject then
+            local reason, ttl = _M.blocked(subject)
             if reason then
-                blocked[#blocked + 1] = { user = user, reason = reason,
-                                          seconds_left = ttl }
+                local user, provider = subject:match("^([^@]+)@(.+)$")
+                blocked[#blocked + 1] = { user = user or subject, provider = provider,
+                                          reason = reason, seconds_left = ttl }
             end
         end
     end
     setmetatable(blocked, cjson.array_mt)
-    return ngx.say(cjson.encode({ blocked = blocked, limits = {
-        window = limits.window, max_downloads = limits.max_downloads,
-        max_mb = limits.max_bytes and limits.max_bytes / 1048576,
-        block = limits.block,
-    } }))
+    local per_provider = {}
+    for _, p in ipairs(cfg.providers) do
+        if p.limits == false then
+            per_provider[p.id] = false
+        elseif p.limits then
+            per_provider[p.id] = describe(p.limits)
+        end
+    end
+    return ngx.say(cjson.encode({
+        blocked = blocked,
+        limits = cfg.limits and describe(cfg.limits) or false,
+        providers = per_provider,
+    }))
 end
 
 return _M

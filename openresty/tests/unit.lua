@@ -91,10 +91,15 @@ eq(login.split_url("https://user@www.jstor.org/"), nil, "split_url userinfo reje
 eq(login.split_url("javascript:alert(1)"), nil, "split_url non-http")
 
 -- usage limits
-local lim = config.build({
-    limits = { window = 100, max_downloads = 2, max_mb = 1, block = 60 },
-    providers = { { id = "x", hosts = { "x.org" } } },
-}, "p.org").limits
+local lcfg = config.build({
+    limits = { window = 100, max_downloads = 2, max_mb = 1, block = 60, contact = "lib" },
+    providers = {
+        { id = "x", hosts = { "x.org" } },
+        { id = "strict", hosts = { "strict.org" }, limits = { max_downloads = 1 } },
+        { id = "free", hosts = { "free.org" }, limits = false },
+    },
+}, "p.org")
+local lim = lcfg.limits
 eq(lim.max_bytes, 1048576, "limits max_mb")
 eq(config.build({ providers = {} }, "p.org").limits, nil, "limits disabled by default")
 eq(limits.is_download(lim, 200, "application/pdf"), true, "download pdf")
@@ -112,7 +117,7 @@ limits.record(lim, "u1", 100, true, t + 2)
 eq(type(limits.blocked("u1")), "string", "over download limit blocked")
 local _, ttl = limits.blocked("u1")
 eq(ttl > 59 and ttl <= 60, true, "block ttl")
-eq(limits.unblock(lim, "u1", t + 3), true, "unblock")
+eq(limits.unblock(lcfg, "u1", t + 3), true, "unblock")
 eq(limits.blocked("u1"), nil, "unblocked")
 local d = limits.record(lim, "u1", 0, false, t + 4)
 eq(d, 0, "counters reset after unblock")
@@ -129,6 +134,50 @@ d = limits.record(lim, "u3", 0, false, t + 150)   -- next window, 50% elapsed
 eq(d, 1, "sliding window weight")
 d = limits.record(lim, "u3", 0, false, t + 199)
 eq(d < 0.05, true, "sliding window decays")
+
+-- per-provider limits
+local strict = config.lookup(lcfg, "strict.org")
+local free = config.lookup(lcfg, "free.org")
+local x = config.lookup(lcfg, "x.org")
+eq(strict.limits.max_downloads, 1, "provider limit threshold")
+eq(strict.limits.window, 100, "provider limit inherits window")
+eq(strict.limits.block, 60, "provider limit inherits block")
+eq(strict.limits.contact, "lib", "provider limit inherits contact")
+eq(strict.limits.download_types["application/pdf"], true, "provider limit inherits types")
+eq(free.limits, false, "provider exempt")
+eq(x.limits, nil, "provider without own limits")
+
+local function keys(rules)
+    local out = {}
+    for _, r in ipairs(rules) do out[#out + 1] = r.key end
+    return table.concat(out, ",")
+end
+eq(keys(limits.rules(lcfg, x, "u4")), "u4", "rules global only")
+eq(keys(limits.rules(lcfg, strict, "u4")), "u4,u4@strict", "rules global and provider")
+eq(keys(limits.rules(lcfg, free, "u4")), "", "rules exempt provider")
+eq(limits.enabled(lcfg), true, "limits enabled")
+local only_provider = config.build({ providers = {
+    { id = "s", hosts = { "s.org" }, limits = { max_mb = 5 } } } }, "p.org")
+eq(limits.enabled(only_provider), true, "provider limits without global limits")
+eq(keys(limits.rules(only_provider, config.lookup(only_provider, "s.org"), "u")), "u@s",
+   "rules provider only")
+eq(limits.enabled(config.build({ providers = {} }, "p.org")), false, "limits disabled")
+
+limits.record(strict.limits, "u4@strict", 0, true, t)
+limits.record(strict.limits, "u4@strict", 0, true, t)
+eq(type(limits.blocked("u4@strict")), "string", "provider limit blocks provider")
+eq(limits.blocked("u4"), nil, "provider block is not global")
+limits.record(lim, "u4", 0, true, t)
+limits.record(lim, "u4", 0, true, t)
+limits.record(lim, "u4", 0, true, t)
+eq(type(limits.blocked("u4")), "string", "global block too")
+eq(limits.unblock(lcfg, "u4", t), true, "unblock all")
+eq(limits.blocked("u4@strict"), nil, "unblock clears provider block")
+eq(limits.blocked("u4"), nil, "unblock clears global block")
+eq(limits.unblock(lcfg, "u4", t), false, "unblock nothing left")
+local ok = pcall(config.build, { providers = {
+    { id = "bad", hosts = { "bad.org" }, limits = "yes" } } }, "p.org")
+eq(ok, false, "invalid provider limits rejected")
 
 print(string.format("%d/%d passed", count - failures, count))
 os.exit(failures > 0 and 1 or 0)

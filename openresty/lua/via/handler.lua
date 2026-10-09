@@ -75,11 +75,13 @@ function _M.access()
     ngx.ctx.user = user
     ngx.var.via_user_hash = user
 
-    if config.current.limits then
-        local reason, ttl = limits.blocked(user)
+    local rules = limits.rules(config.current, ngx.ctx.provider, user)
+    ngx.ctx.rules = rules
+    for _, rule in ipairs(rules) do
+        local reason, ttl = limits.blocked(rule.key)
         if reason then
             ngx.ctx.blocked = true
-            return pages.blocked(ttl, config.current.limits.contact)
+            return pages.blocked(ttl, rule.limits.contact)
         end
     end
 end
@@ -117,8 +119,8 @@ function _M.header_filter()
     ctype = ctype and ctype:lower()
     local status = ngx.status
 
-    if cfg.limits then
-        ngx.ctx.download = limits.is_download(cfg.limits, status, ctype,
+    for _, rule in ipairs(ngx.ctx.rules or {}) do
+        rule.download = limits.is_download(rule.limits, status, ctype,
             ngx.header["Content-Disposition"], ngx.header["Content-Range"])
     end
     if ctype and provider.content_types[ctype]
@@ -168,12 +170,13 @@ end
 
 function _M.log()
     local ctx = ngx.ctx
-    local cfg = config.current
-    if not (cfg.limits and ctx.user and ctx.provider) or ctx.blocked then
+    if not ctx.rules or ctx.blocked then
         return
     end
-    limits.record(cfg.limits, ctx.user, tonumber(ngx.var.bytes_sent) or 0,
-                  ctx.download, ngx.now())
+    local bytes, now = tonumber(ngx.var.bytes_sent) or 0, ngx.now()
+    for _, rule in ipairs(ctx.rules) do
+        limits.record(rule.limits, rule.key, bytes, rule.download, now)
+    end
 end
 
 return _M

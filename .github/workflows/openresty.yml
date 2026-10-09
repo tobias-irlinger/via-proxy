@@ -18,7 +18,7 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: shellcheck
         run: shellcheck scripts/*.sh tests/*.sh
       - name: JSON
@@ -30,7 +30,7 @@ jobs:
   unit:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Lua unit tests
         run: tests/unit.sh
 
@@ -38,10 +38,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Pull images
         run: |
           docker compose --env-file tests/test.env \
             -f docker-compose.yml -f tests/docker-compose.test.yml pull --quiet
       - name: End-to-end tests
         run: DEBUG=1 tests/e2e.sh
+
+  acme:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install certbot
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq certbot python3-certbot-dns-rfc2136
+      - name: ACME issuance and renewal (Pebble + BIND)
+        run: DEBUG=1 tests/acme.sh

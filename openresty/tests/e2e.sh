@@ -25,12 +25,16 @@ compose up -d >/dev/null 2>&1 || { echo "compose up failed"; exit 1; }
 
 PUB=www-example--publisher-test.proxy.test
 CDN=cdn-example--publisher-test.proxy.test
+STRICT=www-strict--publisher-test.proxy.test
+FREE=www-free--publisher-test.proxy.test
 c() {
     curl -sk --noproxy '*' \
         --resolve login.proxy.test:443:127.0.0.1 \
         --resolve $PUB:443:127.0.0.1 \
         --resolve $CDN:443:127.0.0.1 \
         --resolve www-google-com.proxy.test:443:127.0.0.1 \
+        --resolve $STRICT:443:127.0.0.1 \
+        --resolve $FREE:443:127.0.0.1 \
         --resolve mock-idp:8080:127.0.0.1 \
         -c "$jar" -b "$jar" "$@"
 }
@@ -77,7 +81,7 @@ target="https://$PUB/echo?a=1&b=2"
 r=$(c -w '%{http_code}' https://login.proxy.test/health)
 check "public /health" test "$r" = $'ok\n200'
 r=$(admin http://127.0.0.1:8081/status)
-check "admin /status reports config" has "$r" '"providers":1'
+check "admin /status reports config" has "$r" '"providers":3'
 version=$(sed -n 's/.*"version":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
 for _ in $(seq 30); do
     health=$(docker inspect --format '{{.State.Health.Status}}' "$(compose ps -q openresty)")
@@ -173,6 +177,34 @@ jar=$work/alice
 r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
 check "other users unaffected" has "$r" "200"
 
+# per-provider limits: "strict" allows 1 download, "free" is not counted
+pseudonym() { printf %s "$1" | openssl dgst -sha1 -hmac test-log-key | awk '{print $NF}' | cut -c1-16; }
+jar=$work/erin
+login erin member@example.org "https://$PUB/echo" >/dev/null
+c -o /dev/null "https://$STRICT/doc.pdf"
+r=$(c -o /dev/null -w '%{http_code}' "https://$STRICT/doc.pdf")
+check "provider limit: download over the limit still delivered" has "$r" "200"
+r=$(c -o /dev/null -w '%{http_code}' "https://$STRICT/doc.pdf")
+check "provider limit: blocked for this provider" has "$r" "429"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+check "provider limit: other providers still work" has "$r" "200"
+r=$(admin http://127.0.0.1:8081/limits)
+check "admin API shows provider block" has "$r" "\"provider\":\"strict\""
+r=$(admin "http://127.0.0.1:8081/limits?user=$(pseudonym erin)")
+check "admin API shows provider counters" has "$r" '"strict":{'
+admin -X POST "http://127.0.0.1:8081/limits?unblock=$(pseudonym erin)" >/dev/null
+r=$(c -o /dev/null -w '%{http_code}' "https://$STRICT/doc.pdf")
+check "unblock lifts provider block" has "$r" "200"
+
+jar=$work/frank
+login frank member@example.org "https://$PUB/echo" >/dev/null
+for _ in 1 2 3 4 5; do
+    r=$(c -o /dev/null -w '%{http_code}' "https://$FREE/doc.pdf")
+done
+check "exempt provider: no download limit" has "$r" "200"
+r=$(admin "http://127.0.0.1:8081/limits?user=$(pseudonym frank)")
+check "exempt provider: not counted globally" has "$r" '"downloads":0'
+
 # reload providers.json without restart (replaced like an editor does)
 wait_version() {   # wait_version <old version>: prints new /status
     local r
@@ -194,7 +226,7 @@ json.dump(d, open(p + ".tmp", "w"), indent=2)
 PY
 mv "$work/config/providers.json.tmp" "$work/config/providers.json"
 r=$(wait_version "$version")
-check "reload picked up new file" has "$r" '"providers":2'
+check "reload picked up new file" has "$r" '"providers":4'
 new_version=$(sed -n 's/.*"version":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
 sleep 2   # every worker polls on its own
 for i in 1 2 3 4; do

@@ -22,6 +22,8 @@ services:
       # single-file bind mount would keep showing the old version
       - ${VIA_CONFIG_DIR:-./config}:/etc/via/config:ro
       - ${VIA_CERT_DIR:-./certs}:/etc/via/certs:ro
+      # ACME webroot challenge files, written by certbot (setup_acme.sh)
+      - ${VIA_ACME_WEBROOT:-./acme-webroot}:/etc/via/acme:ro
     healthcheck:
       # /health also checks oauth2-proxy (its image has no shell for a check)
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /health HTTP/1.0\r\n\r\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]

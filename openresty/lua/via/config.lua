@@ -69,6 +69,7 @@ function _M.build(data, proxy_domain)
             cookies = p.cookies or "prefix",
             content_types = set_of(p.content_types or default_types),
             substitutions = subs,
+            limits = limits.build_provider(p.limits, cfg.limits, set_of),
         }
         assert(provider.cookies == "prefix" or provider.cookies == "host",
                "provider " .. p.id .. ": cookies must be 'prefix' or 'host'")

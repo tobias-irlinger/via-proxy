@@ -26,3 +26,6 @@ services:
         aliases:
           - www.example-publisher.test
           - cdn.example-publisher.test
+          # served by the default server block (same content)
+          - www.strict-publisher.test
+          - www.free-publisher.test

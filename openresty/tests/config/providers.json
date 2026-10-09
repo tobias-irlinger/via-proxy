@@ -16,6 +16,26 @@
         ".example-publisher.test"
       ],
       "scheme": "http"
+    },
+    {
+      "id": "strict",
+      "name": "Strict Publisher",
+      "hosts": [
+        "www.strict-publisher.test"
+      ],
+      "scheme": "http",
+      "limits": {
+        "max_downloads": 1
+      }
+    },
+    {
+      "id": "free",
+      "name": "Free Publisher",
+      "hosts": [
+        "www.free-publisher.test"
+      ],
+      "scheme": "http",
+      "limits": false
     }
   ]
 }

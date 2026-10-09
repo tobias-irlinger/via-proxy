@@ -56,10 +56,14 @@ openresty/
 │   ├── limits.lua           Download-Limits pro Nutzer, Admin-API
 │   ├── login.lua            /login?url= und Startseite
 │   └── pages.lua            Fehlerseiten
-├── scripts/dev-cert.sh      selbstsigniertes Wildcard-Zertifikat für Tests
+├── scripts/
+│   ├── setup_acme.sh        Wildcard-Zertifikat per ACME (HM-CA mit EAB)
+│   ├── acme-deploy-hook.sh  certbot-Hook: Zertifikat kopieren, OpenResty neu laden
+│   └── dev-cert.sh          selbstsigniertes Wildcard-Zertifikat für Tests
 └── tests/
     ├── unit.sh, unit.lua    Unit-Tests (im OpenResty-Image)
-    ├── e2e.sh               End-to-End-Test mit Mock-IdP und Test-Verlag
+    ├── e2e.sh               End-to-End-Test mit Mock-IdP und Test-Verlagen
+    ├── acme.sh              Zertifikat ausstellen/erneuern gegen Pebble + BIND
     └── …
 ```
 
@@ -138,12 +142,30 @@ in `config/providers.json`:
 - Sperren werden als `via-limit: user <pseudonym> blocked …` (Level `warn`)
   geloggt und lassen sich so für Alarme auswerten.
 
+Zusätzlich kann jeder Anbieter eigene Limits bekommen:
+
+```json
+{ "id": "jstor", "hosts": ["www.jstor.org"],
+  "limits": { "max_downloads": 50, "window": 3600 } },
+{ "id": "doi", "hosts": ["doi.org"], "limits": false }
+```
+
+- **Objekt:** eigene Zähler und Schwellen für diesen Anbieter, *zusätzlich*
+  zu den globalen Limits. Nicht gesetzte Werte (`window`, `block`,
+  `contact`, `download_types`) werden von den globalen Limits übernommen.
+  Eine Sperre gilt dann **nur für diesen Anbieter**; andere bleiben
+  erreichbar. Sinnvoll für Anbieter mit strengeren Vertragsklauseln.
+- **`false`:** Zugriffe auf diesen Anbieter werden gar nicht gezählt, z. B.
+  beim DOI-Resolver, der nur weiterleitet.
+- Fehlt `limits`, gelten nur die globalen Limits. Anbieter-Limits
+  funktionieren auch ohne globalen `limits`-Block.
+
 Admin-API, nur vom Server selbst erreichbar (Port 8081 auf `127.0.0.1`):
 
 ```sh
-curl http://127.0.0.1:8081/limits                            # gesperrte Nutzer
+curl http://127.0.0.1:8081/limits                            # Sperren (global und je Anbieter)
 curl http://127.0.0.1:8081/limits?user=<pseudonym>           # Zähler eines Nutzers
-curl -X POST http://127.0.0.1:8081/limits?unblock=<pseudonym>
+curl -X POST http://127.0.0.1:8081/limits?unblock=<pseudonym> # alle Sperren aufheben
 ```
 
 Nutzer werden nur über ihr Pseudonym geführt (HMAC der OIDC-`sub` mit
@@ -174,11 +196,9 @@ OpenResty es mit.
 ## Einrichtung
 
 1. **DNS**: `*.proxy.example.org` (und `login.proxy.example.org`) auf den Server.
-2. **Zertifikat**: Wildcard `*.proxy.example.org` (Let's Encrypt nur per
-   DNS-01). `fullchain.pem` und `privkey.pem` in `certs/` ablegen bzw.
-   `VIA_CERT_DIR` setzen. Achtung: `/etc/letsencrypt/live/…` enthält Symlinks,
-   die im Container nicht auflösbar sind. Am einfachsten kopiert ein
-   certbot-Deploy-Hook die Dateien.
+2. **Zertifikat**: Wildcard `*.proxy.example.org` per
+   `scripts/setup_acme.sh` (siehe [Zertifikat per ACME](#zertifikat-per-acme)),
+   oder `fullchain.pem` und `privkey.pem` von Hand in `certs/` ablegen.
 3. **Shibboleth IdP** (ab 4.1 mit OIDC-OP-Plugin): Client (RP) registrieren
    - Redirect-URI: `https://login.proxy.example.org/oauth2/callback`
    - Grant: Authorization Code, PKCE erlaubt, Client-Secret (`client_secret_basic`)
@@ -196,24 +216,69 @@ Für Discovery/Linkresolver das bisherige EZproxy-Präfix
 `https://ezproxy.example.org/login?url=` durch
 `https://login.proxy.example.org/login?url=` ersetzen.
 
+## Zertifikat per ACME
+
+`scripts/setup_acme.sh` folgt dem Vorgehen aus `HM_template`: certbot am
+internen ACME-Server der HM (`https://acme.hm.edu/acme/acme/directory`) mit
+EAB-Zugangsdaten vom PKI-Team. Die Einstellungen stehen in `.env`
+(`ACME_*`, siehe `.env.example`).
+
+```sh
+./scripts/setup_acme.sh      # einmalig; danach erneuert certbot.timer automatisch
+sudo certbot renew --dry-run # Erneuerung testen
+```
+
+Unterschiede zum Template:
+
+- **Wildcard**: ausgestellt wird für `<domain>` und `*.<domain>`. ACME
+  verlangt für Wildcards die **DNS-Challenge**, der Standalone-Modus des
+  Templates (HTTP-01) reicht dafür nicht.
+  - `ACME_CHALLENGE=dns-rfc2136` (Standard): certbot setzt den TXT-Eintrag
+    `_acme-challenge.<domain>` per dynamischem DNS-Update (RFC 2136). Dafür
+    braucht es einen TSIG-Schlüssel, der für die Zone TXT-Updates darf
+    (`ACME_RFC2136_SERVER`, `_NAME`, `_SECRET`); den stellt das DNS-Team aus.
+    certbot legt die Zugangsdaten mit Rechten 600 ab.
+  - `ACME_CHALLENGE=webroot`: OpenResty liefert
+    `/.well-known/acme-challenge/` auf Port 80 aus. Das genügt **nur**, wenn
+    die CA das Wildcard ohne DNS-Challenge ausstellt (Domain dort vorab
+    validiert). Ob der HM-ACME-Server das tut, muss das PKI-Team sagen.
+- **Kein Standalone**: Port 80 gehört OpenResty, certbot muss ihn nicht
+  übernehmen; es gibt keine Unterbrechung.
+- **Erneuerung**: der Deploy-Hook `scripts/acme-deploy-hook.sh` wird nur für
+  dieses Zertifikat registriert (nicht global unter `renewal-hooks/`). Er
+  kopiert Zertifikat und Schlüssel (600) nach `VIA_CERT_DIR` und lädt
+  OpenResty per `openresty -s reload` neu: laufende Verbindungen und die
+  Zähler der Download-Limits bleiben erhalten.
+
+Wichtig: Das Zertifikat muss in den Browsern der Nutzer gültig sein (also von
+einer öffentlich vertrauten CA stammen, z. B. über DFN/GÉANT TCS), da der
+Proxy auch von privaten Geräten außerhalb des Campus genutzt wird.
+
 ## Tests
 
 ```sh
-tests/unit.sh     # Lua-Unit-Tests (54 Fälle)
-tests/e2e.sh      # kompletter Ablauf mit Docker (52 Fälle), DEBUG=1 für Details
+tests/unit.sh     # Lua-Unit-Tests (76 Fälle)
+tests/e2e.sh      # kompletter Ablauf mit Docker (60 Fälle), DEBUG=1 für Details
+tests/acme.sh     # ACME: Ausstellen + Erneuern (18 Fälle), braucht certbot
 ```
 
 `e2e.sh` startet zusätzlich einen Mock-OIDC-IdP
 (navikt/mock-oauth2-server) und einen simulierten Verlag mit zwei Hosts und
 prüft u. a. Login, Ablehnung von Nicht-Mitgliedern, URL-, Header- und
-Cookie-Rewriting, Download- und Volumen-Limits inkl. Admin-API, Health- und
+Cookie-Rewriting, Download- und Volumen-Limits (global und je Anbieter)
+inkl. Admin-API, Health- und
 Status-Endpunkte, Docker-Healthcheck, Hot-Reload der Anbieterliste (auch mit
 fehlerhafter Datei) sowie dass weder das SSO-Cookie noch Klarnamen nach außen
 bzw. ins Log gelangen.
 
 Die CI ([`.github/workflows/openresty.yml`](../.github/workflows/openresty.yml))
 führt bei jedem Push und Pull Request, der `openresty/` betrifft, shellcheck,
-eine JSON-Prüfung, die Unit-Tests und die End-to-End-Tests aus.
+eine JSON-Prüfung, die Unit-Tests, die End-to-End-Tests und den ACME-Test aus.
+
+`acme.sh` startet Pebble (Test-CA von Let's Encrypt, mit EAB) und einen
+BIND-Server mit TSIG-Schlüssel, stellt über `scripts/setup_acme.sh` ein
+Wildcard-Zertifikat per DNS-01 aus, erzwingt eine Erneuerung und prüft, dass
+OpenResty jeweils das neue Zertifikat ausliefert.
 
 ## Bekannte Grenzen / nächste Schritte
 
@@ -228,7 +293,6 @@ eine JSON-Prüfung, die Unit-Tests und die End-to-End-Tests aus.
   DNS-Label (gleiche Grenze wie EZproxy).
 - Bodies über `max_rewrite_bytes` (Standard 10 MB) werden unverändert
   durchgereicht.
-- Download-Limits gelten global pro Nutzer, nicht getrennt pro Anbieter.
 - Ports in Ziel-URLs (`https://host:8443/`) werden nicht unterstützt.
 - Datenschutz: Aufbewahrungsfrist für Logs festlegen. Die IP-Adresse steht
   weiterhin im Log und muss ggf. gekürzt werden.

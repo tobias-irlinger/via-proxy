@@ -25,7 +25,8 @@
       "hosts": [
         "doi.org",
         "dx.doi.org"
-      ]
+      ],
+      "limits": false
     },
     {
       "id": "jstor",
