@@ -1,5 +1,6 @@
 -- Loads providers.json once in init_by_lua and builds the host allowlist.
 local cjson = require "cjson.safe"
+local limits = require "via.limits"
 
 local _M = {}
 
@@ -43,6 +44,7 @@ function _M.build(data, proxy_domain)
         suffixes = {},  -- ".example.com" -> provider
     }
     local default_types = defaults.content_types or DEFAULT_CONTENT_TYPES
+    cfg.limits = limits.build(data.limits, set_of)
 
     for i, p in ipairs(data.providers or {}) do
         assert(type(p.id) == "string" and p.id:match("^[a-z0-9]+$"),

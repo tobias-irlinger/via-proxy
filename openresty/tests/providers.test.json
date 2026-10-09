@@ -1,10 +1,20 @@
 {
+  "limits": {
+    "window": 3600,
+    "max_downloads": 3,
+    "max_mb": 1,
+    "block": 120,
+    "contact": "test@example.org"
+  },
   "providers": [
     {
       "id": "publisher",
       "name": "Example Publisher",
       "start": "https://www.example-publisher.test/",
-      "hosts": ["www.example-publisher.test", ".example-publisher.test"],
+      "hosts": [
+        "www.example-publisher.test",
+        ".example-publisher.test"
+      ],
       "scheme": "http"
     }
   ]

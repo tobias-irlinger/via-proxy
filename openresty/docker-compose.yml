@@ -7,6 +7,8 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      # admin API (usage limits), reachable from the host only
+      - "127.0.0.1:8081:8081"
     environment:
       PROXY_DOMAIN: ${PROXY_DOMAIN:?PROXY_DOMAIN missing}
       VIA_PROVIDERS: /etc/via/providers.json

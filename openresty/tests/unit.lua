@@ -4,6 +4,7 @@ local config = require "via.config"
 local hostmap = require "via.hostmap"
 local rewrite = require "via.rewrite"
 local login = require "via.login"
+local limits = require "via.limits"
 
 local failures, count = 0, 0
 local function eq(got, want, what)
@@ -88,6 +89,46 @@ eq(h .. " " .. rest, "www.jstor.org /?q=1", "split_url no path")
 eq(login.split_url("https://www.jstor.org:8443/"), nil, "split_url port rejected")
 eq(login.split_url("https://user@www.jstor.org/"), nil, "split_url userinfo rejected")
 eq(login.split_url("javascript:alert(1)"), nil, "split_url non-http")
+
+-- usage limits
+local lim = config.build({
+    limits = { window = 100, max_downloads = 2, max_mb = 1, block = 60 },
+    providers = { { id = "x", hosts = { "x.org" } } },
+}, "p.org").limits
+eq(lim.max_bytes, 1048576, "limits max_mb")
+eq(config.build({ providers = {} }, "p.org").limits, nil, "limits disabled by default")
+eq(limits.is_download(lim, 200, "application/pdf"), true, "download pdf")
+eq(limits.is_download(lim, 200, "text/html"), false, "download html")
+eq(limits.is_download(lim, 200, "text/plain", 'Attachment; filename="a.ris"'), true, "download attachment")
+eq(limits.is_download(lim, 404, "application/pdf"), false, "download 404")
+eq(limits.is_download(lim, 206, "application/pdf", nil, "bytes 0-65535/900000"), true, "download first range")
+eq(limits.is_download(lim, 206, "application/pdf", nil, "bytes 65536-131071/900000"), false, "download later range")
+
+local t = 1000   -- window index 10, start of window
+limits.record(lim, "u1", 100, true, t)
+limits.record(lim, "u1", 100, true, t + 1)
+eq(limits.blocked("u1"), nil, "at limit not blocked")
+limits.record(lim, "u1", 100, true, t + 2)
+eq(type(limits.blocked("u1")), "string", "over download limit blocked")
+local _, ttl = limits.blocked("u1")
+eq(ttl > 59 and ttl <= 60, true, "block ttl")
+eq(limits.unblock(lim, "u1", t + 3), true, "unblock")
+eq(limits.blocked("u1"), nil, "unblocked")
+local d = limits.record(lim, "u1", 0, false, t + 4)
+eq(d, 0, "counters reset after unblock")
+
+limits.record(lim, "u2", 700 * 1024, false, t)
+eq(limits.blocked("u2"), nil, "volume below limit")
+limits.record(lim, "u2", 400 * 1024, false, t)
+eq(type(limits.blocked("u2")), "string", "over volume limit blocked")
+
+-- sliding window: half of the previous window still counts
+limits.record(lim, "u3", 0, true, t + 10)
+limits.record(lim, "u3", 0, true, t + 20)
+d = limits.record(lim, "u3", 0, false, t + 150)   -- next window, 50% elapsed
+eq(d, 1, "sliding window weight")
+d = limits.record(lim, "u3", 0, false, t + 199)
+eq(d < 0.05, true, "sliding window decays")
 
 print(string.format("%d/%d passed", count - failures, count))
 os.exit(failures > 0 and 1 or 0)

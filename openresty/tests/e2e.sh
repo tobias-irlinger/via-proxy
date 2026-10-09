@@ -122,7 +122,44 @@ check "non-member is rejected at login" has "$r" "403"
 r=$(c -o /dev/null -w '%{http_code}' "$target")
 check "non-member gets no session" has "$r" "302"
 
+# usage limits (tests/providers.test.json: 3 downloads or 1 MB per hour)
+admin() { curl -s --noproxy '*' "$@"; }
+jar=$work/carol
+login carol member@example.org "https://$PUB/echo" >/dev/null
+for i in 1 2 3; do
+    r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+done
+check "downloads up to the limit pass" has "$r" "200"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/export")
+check "download over the limit still delivered" has "$r" "200"
+r=$(c -D - "https://$PUB/echo")
+check "user blocked after exceeding downloads" has "$r" "HTTP/2 429"
+check "block page has Retry-After" has "$r" "retry-after: 12"
+check "block page names contact" has "$r" "test@example.org"
+r=$(admin http://127.0.0.1:8081/limits)
+check "admin API lists blocked user" has "$r" "4 downloads in 3600s (limit 3)"
+user=$(sed -n 's/.*"user":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
+r=$(admin -o /dev/null -w '%{http_code}' "http://127.0.0.1:8081/limits?unblock=$user")
+check "admin unblock requires POST" has "$r" "405"
+r=$(admin -X POST "http://127.0.0.1:8081/limits?unblock=$user")
+check "admin unblock" has "$r" '"unblocked":true'
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+check "unblocked user has access again" has "$r" "200"
+
+jar=$work/dave
+login dave member@example.org "https://$PUB/echo" >/dev/null
+c -o /dev/null "https://$PUB/big"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/big")
+check "volume up to the limit passes" has "$r" "200"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/echo")
+check "user blocked after exceeding volume" has "$r" "429"
+
+jar=$work/alice
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+check "other users unaffected" has "$r" "200"
+
 logs=$(compose logs openresty 2>/dev/null)
+check "block is logged with pseudonym" has "$logs" "via-limit: user $user blocked"
 check "access log has no plain user id" hasnt "$logs" "alice"
 
 echo "$((total - fail))/$total passed"

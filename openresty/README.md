@@ -33,6 +33,7 @@ Antwort: Links, Redirects, Cookies werden auf *.proxy.example.org umgeschrieben
 | Header | `Location`, `Link`, `Refresh`, `Access-Control-Allow-Origin` umgeschrieben; `Referer`/`Origin` zurück auf den Original-Host |
 | Cookies | Modus `prefix` (Standard): `v.<anbieter>.<name>`, Domain auf `.<domain>` → geteilt zwischen allen Hosts desselben Anbieters, isoliert von anderen. Modus `host`: Name bleibt, Domain-Attribut entfällt (für Seiten, deren JavaScript eigene Cookies liest) |
 | SSO-Cookie | wird nie an Anbieter weitergegeben |
+| Download-Limits | pro Nutzer: Dokument-Downloads und Datenvolumen im gleitenden Zeitfenster, bei Überschreitung zeitlich begrenzte Sperre (siehe unten) |
 | Logging | Access-Log mit Pseudonym (HMAC der OIDC-`sub` mit `VIA_LOG_KEY`), Anbieter und Ziel-Host, z. B. für ezPAARSE |
 
 ## Dateien
@@ -51,6 +52,7 @@ openresty/
 │   ├── hostmap.lua          Host <-> Proxy-Host
 │   ├── rewrite.lua          URL-, Cookie- und Body-Rewriting
 │   ├── handler.lua          Request-Phasen der Anbieter-Hosts
+│   ├── limits.lua           Download-Limits pro Nutzer, Admin-API
 │   ├── login.lua            /login?url= und Startseite
 │   └── pages.lua            Fehlerseiten
 ├── scripts/dev-cert.sh      selbstsigniertes Wildcard-Zertifikat für Tests
@@ -87,6 +89,57 @@ openresty/
 Änderungen an `providers.json` werden mit `docker compose restart openresty`
 (oder `openresty -s reload`) aktiv.
 
+## Download-Limits
+
+Anbieter sperren bei systematischem Herunterladen meist die IP des Proxys,
+also den Zugang für alle. Wie EZproxys `UsageLimit` zählt der Proxy deshalb
+pro Nutzer und sperrt auffällige Kennungen vorübergehend. Konfiguriert wird das
+in `providers.json`:
+
+```json
+"limits": {
+  "window": 3600,
+  "max_downloads": 150,
+  "max_mb": 2000,
+  "block": 3600,
+  "contact": "Bibliothek, it-bibliothek@example.org"
+}
+```
+
+- **Downloads** sind Antworten mit Status 200 und einem Typ aus
+  `download_types` (Standard: PDF, EPUB, ZIP, `octet-stream`, RIS, BibTeX,
+  Excel) oder mit `Content-Disposition: attachment`. Range-Requests von
+  PDF-Viewern zählen nur einmal, nämlich für den Abschnitt ab Byte 0.
+- **Volumen** zählt alle über den Proxy übertragenen Bytes.
+- Gezählt wird in einem gleitenden Fenster von `window` Sekunden. Wer
+  `max_downloads` oder `max_mb` überschreitet, wird für `block` Sekunden
+  gesperrt und sieht eine Hinweisseite (HTTP 429 mit `Retry-After` und
+  `contact`). Die Anfrage, die das Limit überschreitet, wird noch ausgeliefert.
+- Ohne `limits` ist die Funktion aus. Die Werte oben sind Startwerte und
+  sollten an der bisherigen EZproxy-Statistik geprüft werden.
+- Sperren werden als `via-limit: user <pseudonym> blocked …` (Level `warn`)
+  geloggt und lassen sich so für Alarme auswerten.
+
+Admin-API, nur vom Server selbst erreichbar (Port 8081 auf `127.0.0.1`):
+
+```sh
+curl http://127.0.0.1:8081/limits                            # gesperrte Nutzer
+curl http://127.0.0.1:8081/limits?user=<pseudonym>           # Zähler eines Nutzers
+curl -X POST http://127.0.0.1:8081/limits?unblock=<pseudonym>
+```
+
+Nutzer werden nur über ihr Pseudonym geführt (HMAC der OIDC-`sub` mit
+`VIA_LOG_KEY`). Um eine Person zu kontaktieren, berechnet jemand mit Zugriff
+auf den Schlüssel das Pseudonym für die infrage kommenden `sub`-Werte:
+
+```sh
+printf %s "<sub>" | openssl dgst -sha1 -hmac "$VIA_LOG_KEY" | awk '{print $NF}' | cut -c1-16
+```
+
+Zähler und Sperren liegen im Arbeitsspeicher (`lua_shared_dict`). Sie gelten
+also pro Server und gehen bei einem Neustart verloren, ein Reload behält sie.
+Für mehrere Proxy-Server müsste der Zustand nach Redis.
+
 ## Einrichtung
 
 1. **DNS**: `*.proxy.example.org` (und `login.proxy.example.org`) auf den Server.
@@ -115,14 +168,14 @@ Für Discovery/Linkresolver das bisherige EZproxy-Präfix
 ## Tests
 
 ```sh
-tests/unit.sh     # Lua-Unit-Tests (36 Fälle)
-tests/e2e.sh      # kompletter Ablauf mit Docker (27 Fälle), DEBUG=1 für Details
+tests/unit.sh     # Lua-Unit-Tests (54 Fälle)
+tests/e2e.sh      # kompletter Ablauf mit Docker (40 Fälle), DEBUG=1 für Details
 ```
 
 `e2e.sh` startet zusätzlich einen Mock-OIDC-IdP
 (navikt/mock-oauth2-server) und einen simulierten Verlag mit zwei Hosts und
 prüft u. a. Login, Ablehnung von Nicht-Mitgliedern, URL-, Header- und
-Cookie-Rewriting sowie dass weder das SSO-Cookie noch Klarnamen nach außen
+Cookie-Rewriting, Download- und Volumen-Limits inkl. Admin-API sowie dass weder das SSO-Cookie noch Klarnamen nach außen
 bzw. ins Log gelangen.
 
 ## Bekannte Grenzen / nächste Schritte
@@ -138,8 +191,7 @@ bzw. ins Log gelangen.
   DNS-Label (gleiche Grenze wie EZproxy).
 - Bodies über `max_rewrite_bytes` (Standard 10 MB) werden unverändert
   durchgereicht.
-- **Kein Missbrauchsschutz** (Download-Limits pro Nutzer). Das Pseudonym im
-  Log ist die Grundlage dafür, z. B. per Lua-Zähler in `lua_shared_dict`.
+- Download-Limits gelten global pro Nutzer, nicht getrennt pro Anbieter.
 - Ports in Ziel-URLs (`https://host:8443/`) werden nicht unterstützt.
 - Datenschutz: Aufbewahrungsfrist für Logs festlegen. Die IP-Adresse steht
   weiterhin im Log und muss ggf. gekürzt werden.

@@ -34,4 +34,22 @@ function _M.unknown_host(host)
         "<p>Diese Adresse ist im Bibliotheks-Proxy nicht konfiguriert.</p>" .. link)
 end
 
+-- User exceeded a usage limit (see via.limits).
+function _M.blocked(ttl, contact)
+    local seconds = math.ceil(tonumber(ttl) or 60)
+    local minutes = math.max(1, math.ceil(seconds / 60))
+    ngx.header["Retry-After"] = tostring(seconds)
+    local contact_html = ""
+    if contact then
+        contact_html = "<p>Bei Fragen: " .. _M.escape(contact) .. "</p>"
+    end
+    return _M.send(429, "Zugang vorübergehend gesperrt",
+        "<p>Über Ihre Kennung wurden in kurzer Zeit ungewöhnlich viele " ..
+        "Dokumente bzw. Daten abgerufen. Systematisches Herunterladen ist " ..
+        "nach den Lizenzbedingungen der Anbieter nicht erlaubt und kann zur " ..
+        "Sperrung des Zugangs für die gesamte Hochschule führen.</p>" ..
+        "<p>Die Sperre endet automatisch in etwa " .. minutes ..
+        " Minuten.</p>" .. contact_html)
+end
+
 return _M

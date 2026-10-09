@@ -10,6 +10,13 @@
       "application/json"
     ]
   },
+  "limits": {
+    "window": 3600,
+    "max_downloads": 150,
+    "max_mb": 2000,
+    "block": 3600,
+    "contact": "Bibliothek, it-bibliothek@example.org"
+  },
   "providers": [
     {
       "id": "doi",

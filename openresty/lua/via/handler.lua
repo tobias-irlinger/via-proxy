@@ -3,6 +3,7 @@ local config = require "via.config"
 local hostmap = require "via.hostmap"
 local rewrite = require "via.rewrite"
 local pages = require "via.pages"
+local limits = require "via.limits"
 
 local str = require "resty.string"
 
@@ -59,11 +60,28 @@ function _M.login_redirect()
 end
 
 local function pseudonym(user)
-    local key = config.current.log_key
-    if not user or user == "" or key == "" then
-        return "-"
+    if not user or user == "" then
+        return nil
     end
-    return str.to_hex(ngx.hmac_sha1(key, user)):sub(1, 16)
+    return str.to_hex(ngx.hmac_sha1(config.current.log_key, user)):sub(1, 16)
+end
+
+-- access_by_lua: runs after auth_request, so the user is known here.
+function _M.access()
+    local user = pseudonym(ngx.var.via_user)
+    if not user then
+        return
+    end
+    ngx.ctx.user = user
+    ngx.var.via_user_hash = user
+
+    if config.current.limits then
+        local reason, ttl = limits.blocked(user)
+        if reason then
+            ngx.ctx.blocked = true
+            return pages.blocked(ttl, config.current.limits.contact)
+        end
+    end
 end
 
 function _M.header_filter()
@@ -72,7 +90,6 @@ function _M.header_filter()
         return
     end
     local cfg = config.current
-    ngx.var.via_user_hash = pseudonym(ngx.var.via_user)
 
     for _, name in ipairs(URL_HEADERS) do
         local value = ngx.header[name]
@@ -99,6 +116,11 @@ function _M.header_filter()
     local ctype = (ngx.header["Content-Type"] or ""):match("^%s*([^;%s]+)")
     ctype = ctype and ctype:lower()
     local status = ngx.status
+
+    if cfg.limits then
+        ngx.ctx.download = limits.is_download(cfg.limits, status, ctype,
+            ngx.header["Content-Disposition"], ngx.header["Content-Range"])
+    end
     if ctype and provider.content_types[ctype]
             and not ngx.header["Content-Encoding"]
             and status ~= 204 and status ~= 304
@@ -142,6 +164,16 @@ function _M.body_filter()
     ngx.arg[1] = rewrite.body(config.current, ctx.provider,
                               table.concat(ctx.buf), ctx.rewrite_type)
     ctx.buf = nil
+end
+
+function _M.log()
+    local ctx = ngx.ctx
+    local cfg = config.current
+    if not (cfg.limits and ctx.user and ctx.provider) or ctx.blocked then
+        return
+    end
+    limits.record(cfg.limits, ctx.user, tonumber(ngx.var.bytes_sent) or 0,
+                  ctx.download, ngx.now())
 end
 
 return _M
