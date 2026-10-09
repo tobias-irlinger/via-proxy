@@ -1,0 +1,56 @@
+services:
+  openresty:
+    image: openresty/openresty:1.27.1.2-bookworm
+    restart: unless-stopped
+    depends_on:
+      - oauth2-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PROXY_DOMAIN: ${PROXY_DOMAIN:?PROXY_DOMAIN missing}
+      VIA_PROVIDERS: /etc/via/providers.json
+      VIA_LOG_KEY: ${VIA_LOG_KEY:?VIA_LOG_KEY missing}
+    volumes:
+      - ./nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./nginx:/etc/via/nginx:ro
+      - ./lua:/etc/via/lua:ro
+      - ${VIA_PROVIDERS_FILE:-./providers.json}:/etc/via/providers.json:ro
+      - ${VIA_CERT_DIR:-./certs}:/etc/via/certs:ro
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.12.0
+    restart: unless-stopped
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_UPSTREAMS: static://202
+      OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_APPROVAL_PROMPT: auto
+
+      # OIDC at the Shibboleth IdP (OIDC OP plugin)
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_PROVIDER_DISPLAY_NAME: Hochschul-Login
+      OAUTH2_PROXY_OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?OIDC_ISSUER_URL missing}
+      OAUTH2_PROXY_CLIENT_ID: ${OIDC_CLIENT_ID:?OIDC_CLIENT_ID missing}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET missing}
+      OAUTH2_PROXY_SCOPE: ${OIDC_SCOPE:-openid profile email}
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+      OAUTH2_PROXY_REDIRECT_URL: https://login.${PROXY_DOMAIN}/oauth2/callback
+      OAUTH2_PROXY_USER_ID_CLAIM: sub
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: "true"
+
+      # licence terms: only members (students/staff), not alumni or guests
+      OAUTH2_PROXY_OIDC_GROUPS_CLAIM: eduperson_scoped_affiliation
+      OAUTH2_PROXY_ALLOWED_GROUPS: ${ALLOWED_AFFILIATIONS:?ALLOWED_AFFILIATIONS missing}
+
+      # one session cookie for login host and all provider hosts
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_COOKIE_SECRET:?OAUTH2_COOKIE_SECRET missing}
+      OAUTH2_PROXY_COOKIE_DOMAINS: .${PROXY_DOMAIN}
+      OAUTH2_PROXY_WHITELIST_DOMAINS: .${PROXY_DOMAIN}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_EXPIRE: 12h
+      OAUTH2_PROXY_SESSION_COOKIE_MINIMAL: "true"

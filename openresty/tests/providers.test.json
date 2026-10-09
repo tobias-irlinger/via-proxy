@@ -1,0 +1,11 @@
+{
+  "providers": [
+    {
+      "id": "publisher",
+      "name": "Example Publisher",
+      "start": "https://www.example-publisher.test/",
+      "hosts": ["www.example-publisher.test", ".example-publisher.test"],
+      "scheme": "http"
+    }
+  ]
+}

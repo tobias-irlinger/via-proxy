@@ -204,3 +204,10 @@ Priorisiert nach Nutzen:
    nicht. Erst danach über Starting-Point, SSO und Migration entscheiden.
 5. Anbieter informieren bzw. IP-Freischaltung für den neuen Proxy-Server
    beantragen (gleiche Anforderung wie bei EZproxy).
+
+## 7. Prototyp: OpenResty + oauth2-proxy
+
+Als Alternative zur Apache-Variante gibt es unter [`openresty/`](../openresty/)
+einen Prototyp. Er setzt die Punkte 1–4 aus Abschnitt 5 um: Starting-Point-URL,
+OIDC-Login am Shibboleth-IdP, Hostnamen mit Bindestrichen und ein Wildcard-Zertifikat
+sowie eine zentrale Anbieterliste statt einer Konfigurationsdatei pro Anbieter.
