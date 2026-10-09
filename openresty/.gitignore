@@ -1,0 +1,4 @@
+.env
+certs/*.pem
+acme-webroot/*
+!acme-webroot/.gitkeep

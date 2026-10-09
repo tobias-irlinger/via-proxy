@@ -1,0 +1,273 @@
+#!/bin/bash
+# End-to-end test: OpenResty + oauth2-proxy + mock OIDC IdP + fake publisher.
+#   tests/e2e.sh          start stack, run tests, stop stack
+#   KEEP=1 tests/e2e.sh   leave the stack running afterwards
+set -u
+cd "$(dirname "$0")/.." || exit 1
+
+compose() {
+    docker compose --env-file tests/test.env \
+        -f docker-compose.yml -f tests/docker-compose.test.yml "$@"
+}
+
+work=$(mktemp -d)
+cleanup() {
+    [ "${KEEP:-}" = 1 ] || compose down -v >/dev/null 2>&1
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+[ -f certs/fullchain.pem ] || scripts/dev-cert.sh proxy.test
+# work on a copy of the provider config so the reload test can change it
+cp -r tests/config "$work/config"
+export VIA_CONFIG_DIR=$work/config
+compose up -d >/dev/null 2>&1 || { echo "compose up failed"; exit 1; }
+
+PUB=www-example--publisher-test.proxy.test
+CDN=cdn-example--publisher-test.proxy.test
+STRICT=www-strict--publisher-test.proxy.test
+FREE=www-free--publisher-test.proxy.test
+c() {
+    curl -sk --noproxy '*' \
+        --resolve login.proxy.test:443:127.0.0.1 \
+        --resolve $PUB:443:127.0.0.1 \
+        --resolve $CDN:443:127.0.0.1 \
+        --resolve www-google-com.proxy.test:443:127.0.0.1 \
+        --resolve $STRICT:443:127.0.0.1 \
+        --resolve $FREE:443:127.0.0.1 \
+        --resolve mock-idp:8080:127.0.0.1 \
+        -c "$jar" -b "$jar" "$@"
+}
+
+fail=0 total=0
+check() {   # check <description> <command...>
+    total=$((total + 1))
+    local desc=$1; shift
+    if "$@"; then
+        echo "ok   $desc"
+    else
+        echo "FAIL $desc"
+        [ -n "${DEBUG:-}" ] && printf '     got: %.300s\n' "$2"
+        fail=$((fail + 1))
+    fi
+}
+has() { grep -qF -- "$2" <<<"$1"; }
+hasnt() { ! grep -qF -- "$2" <<<"$1"; }
+
+admin() { curl -s --noproxy '*' "$@"; }
+
+# wait until /health reports oauth2-proxy ready (OIDC discovery done)
+for _ in $(seq 90); do
+    [ "$(admin http://127.0.0.1:8081/health)" = ok ] && break
+    sleep 1
+done
+
+# login <user> <affiliation> <target url>
+#   prints the callback status and the URL it redirects to
+login() {
+    local loc
+    loc=$(c -o /dev/null -w '%{redirect_url}' "$3")                 # -> login host
+    loc=$(c -o /dev/null -w '%{redirect_url}' "$loc")               # -> IdP
+    loc=$(c -o /dev/null -w '%{redirect_url}' "$loc" \
+        --data-urlencode "username=$1" \
+        --data-urlencode "claims={\"eduperson_scoped_affiliation\":[\"$2\"]}")  # -> callback
+    c -o /dev/null -w '%{http_code} %{redirect_url}' "$loc"
+}
+
+jar=$work/alice
+target="https://$PUB/echo?a=1&b=2"
+
+# health and status
+r=$(c -w '%{http_code}' https://login.proxy.test/health)
+check "public /health" test "$r" = $'ok\n200'
+r=$(admin http://127.0.0.1:8081/status)
+check "admin /status reports config" has "$r" '"providers":3'
+version=$(sed -n 's/.*"version":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
+for _ in $(seq 30); do
+    health=$(docker inspect --format '{{.State.Health.Status}}' "$(compose ps -q openresty)")
+    [ "$health" = healthy ] && break
+    sleep 1
+done
+check "docker healthcheck healthy" has "$health" "healthy"
+
+r=$(c -o /dev/null -w '%{http_code} %{redirect_url}' \
+    "https://login.proxy.test/login?url=https://www.example-publisher.test/echo?a=1&b=2")
+check "starting point maps to proxy host" has "$r" "302 $target"
+
+r=$(c -o /dev/null -w '%{http_code} %{redirect_url}' "$target")
+check "no session -> login redirect" has "$r" "302 https://login.proxy.test/oauth2/start?rd="
+
+# (the mock IdP drops "&b=2" from the state, so log in with a simpler URL)
+r=$(login alice member@example.org "https://$PUB/echo?a=1")
+check "login redirects back to target" has "$r" "302 https://$PUB/echo?a=1"
+r=$(c "$target")
+check "proxied request reaches provider" has "$r" "host=www.example-publisher.test"
+check "query string preserved" has "$(compose logs upstream 2>/dev/null)" "GET /echo?a=1&b=2"
+check "SSO cookie not sent upstream" hasnt "$r" "_oauth2_proxy"
+check "Accept-Encoding removed" grep -qx "accept_encoding=" <<<"$r"
+
+h=$(c -D - -o "$work/page" "https://$PUB/")
+p=$(cat "$work/page")
+check "absolute link rewritten" has "$p" "href=\"https://$PUB/article/1\""
+check "http link upgraded" has "$p" "href=\"https://$PUB/article/2\""
+check "protocol-relative link rewritten" has "$p" "src=\"//$CDN/app.js\""
+check "JSON-escaped URL rewritten" has "$p" "https:\\/\\/$PUB\\/api"
+check "integrity attribute removed" hasnt "$p" "integrity="
+check "foreign link untouched" has "$p" "https://unknown.example.net/"
+check "domain cookie prefixed and widened" has "$h" "v.publisher.session=abc; Path=/; Secure; HttpOnly; Domain=.proxy.test"
+check "host-only cookie prefixed" has "$h" "v.publisher.hostonly=1; Path=/"
+check "CSP removed" hasnt "$h" "content-security-policy"
+
+r=$(c "https://$PUB/echo")
+check "provider cookie sent unprefixed" has "$r" "session=abc"
+check "host-only cookie sent unprefixed" has "$r" "hostonly=1"
+r=$(c "https://$CDN/")
+check "domain cookie shared with other provider host" has "$r" "cdn cookie=session=abc"
+check "host-only cookie not shared" hasnt "$r" "hostonly"
+
+r=$(c -o /dev/null -w '%{http_code} %{redirect_url}' "https://$PUB/redirect")
+check "Location rewritten" has "$r" "302 https://$CDN/file.pdf"
+
+r=$(c -H "Referer: https://$PUB/search?q=x" "https://$PUB/echo")
+check "Referer mapped back to original" has "$r" "referer=http://www.example-publisher.test/search?q=x"
+
+r=$(c -o /dev/null -w '%{http_code}' "https://www-google-com.proxy.test/")
+check "unknown host -> 404" has "$r" "404"
+r=$(c -o /dev/null -w '%{http_code}' "https://login.proxy.test/login?url=https://www.google.com/")
+check "starting point for unknown host -> 403" has "$r" "403"
+
+jar=$work/bob
+r=$(login bob affiliate@example.org "$target")
+check "non-member is rejected at login" has "$r" "403"
+r=$(c -o /dev/null -w '%{http_code}' "$target")
+check "non-member gets no session" has "$r" "302"
+
+# usage limits (tests/config/providers.json: 3 downloads or 1 MB per hour)
+jar=$work/carol
+login carol member@example.org "https://$PUB/echo" >/dev/null
+for i in 1 2 3; do
+    r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+done
+check "downloads up to the limit pass" has "$r" "200"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/export")
+check "download over the limit still delivered" has "$r" "200"
+r=$(c -D - "https://$PUB/echo")
+check "user blocked after exceeding downloads" has "$r" "HTTP/2 429"
+check "block page has Retry-After" has "$r" "retry-after: 12"
+check "block page names contact" has "$r" "test@example.org"
+r=$(admin http://127.0.0.1:8081/limits)
+check "admin API lists blocked user" has "$r" "4 downloads in 3600s (limit 3)"
+user=$(sed -n 's/.*"user":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
+r=$(admin -o /dev/null -w '%{http_code}' "http://127.0.0.1:8081/limits?unblock=$user")
+check "admin unblock requires POST" has "$r" "405"
+r=$(admin -X POST "http://127.0.0.1:8081/limits?unblock=$user")
+check "admin unblock" has "$r" '"unblocked":true'
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+check "unblocked user has access again" has "$r" "200"
+
+jar=$work/dave
+login dave member@example.org "https://$PUB/echo" >/dev/null
+c -o /dev/null "https://$PUB/big"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/big")
+check "volume up to the limit passes" has "$r" "200"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/echo")
+check "user blocked after exceeding volume" has "$r" "429"
+
+jar=$work/alice
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+check "other users unaffected" has "$r" "200"
+
+# per-provider limits: "strict" allows 1 download, "free" is not counted
+pseudonym() { printf %s "$1" | openssl dgst -sha1 -hmac test-log-key | awk '{print $NF}' | cut -c1-16; }
+jar=$work/erin
+login erin member@example.org "https://$PUB/echo" >/dev/null
+c -o /dev/null "https://$STRICT/doc.pdf"
+r=$(c -o /dev/null -w '%{http_code}' "https://$STRICT/doc.pdf")
+check "provider limit: download over the limit still delivered" has "$r" "200"
+r=$(c -o /dev/null -w '%{http_code}' "https://$STRICT/doc.pdf")
+check "provider limit: blocked for this provider" has "$r" "429"
+r=$(c -o /dev/null -w '%{http_code}' "https://$PUB/doc.pdf")
+check "provider limit: other providers still work" has "$r" "200"
+r=$(admin http://127.0.0.1:8081/limits)
+check "admin API shows provider block" has "$r" "\"provider\":\"strict\""
+r=$(admin "http://127.0.0.1:8081/limits?user=$(pseudonym erin)")
+check "admin API shows provider counters" has "$r" '"strict":{'
+admin -X POST "http://127.0.0.1:8081/limits?unblock=$(pseudonym erin)" >/dev/null
+r=$(c -o /dev/null -w '%{http_code}' "https://$STRICT/doc.pdf")
+check "unblock lifts provider block" has "$r" "200"
+
+jar=$work/frank
+login frank member@example.org "https://$PUB/echo" >/dev/null
+for _ in 1 2 3 4 5; do
+    r=$(c -o /dev/null -w '%{http_code}' "https://$FREE/doc.pdf")
+done
+check "exempt provider: no download limit" has "$r" "200"
+r=$(admin "http://127.0.0.1:8081/limits?user=$(pseudonym frank)")
+check "exempt provider: not counted globally" has "$r" '"downloads":0'
+
+# reload providers.json without restart (replaced like an editor does)
+wait_version() {   # wait_version <old version>: prints new /status
+    local r
+    for _ in $(seq 20); do
+        r=$(admin http://127.0.0.1:8081/status)
+        has "$r" "\"version\":\"$1\"" || { echo "$r"; return; }
+        sleep 0.5
+    done
+    echo "$r"
+}
+r=$(c -o /dev/null -w '%{http_code}' "https://login.proxy.test/login?url=https://www.extra.test/")
+check "new provider unknown before reload" has "$r" "403"
+python3 - "$work/config/providers.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["providers"].append({"id": "extra", "name": "Extra", "hosts": ["www.extra.test"]})
+json.dump(d, open(p + ".tmp", "w"), indent=2)
+PY
+mv "$work/config/providers.json.tmp" "$work/config/providers.json"
+r=$(wait_version "$version")
+check "reload picked up new file" has "$r" '"providers":4'
+new_version=$(sed -n 's/.*"version":"\([0-9a-f]*\)".*/\1/p' <<<"$r")
+sleep 2   # every worker polls on its own
+for i in 1 2 3 4; do
+    r=$(c -o /dev/null -w '%{http_code} %{redirect_url}' "https://login.proxy.test/login?url=https://www.extra.test/x")
+    check "new provider active after reload ($i)" has "$r" "302 https://www-extra-test.proxy.test/x"
+done
+cp "$work/config/providers.json" "$work/providers.good.json"
+echo '{ broken' > "$work/config/providers.json.tmp"
+mv "$work/config/providers.json.tmp" "$work/config/providers.json"
+sleep 2
+r=$(admin http://127.0.0.1:8081/status)
+check "broken file keeps old config" has "$r" "\"version\":\"$new_version\""
+check "broken file reported in status" has "$r" "cannot parse"
+r=$(c -o /dev/null -w '%{http_code}' "https://login.proxy.test/login?url=https://www.extra.test/")
+check "proxy keeps working with broken file" has "$r" "302"
+
+# OpenResty must start (and reload) while oauth2-proxy is down
+# (with a valid config again: a broken providers.json blocks the start)
+cp "$work/providers.good.json" "$work/config/providers.json"
+compose stop oauth2-proxy >/dev/null 2>&1
+compose restart openresty >/dev/null 2>&1
+for _ in $(seq 30); do
+    code=$(admin -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/health)
+    [ "$code" = 503 ] && break
+    sleep 1
+done
+check "starts without oauth2-proxy, /health 503" has "$code" "503"
+compose start oauth2-proxy >/dev/null 2>&1
+for _ in $(seq 60); do
+    r=$(admin http://127.0.0.1:8081/health)
+    [ "$r" = ok ] && break
+    sleep 1
+done
+check "recovers when oauth2-proxy is back" test "$r" = ok
+
+logs=$(compose logs openresty 2>/dev/null)
+check "block is logged with pseudonym" has "$logs" "via-limit: user $user blocked"
+check "access log has no plain user id" hasnt "$logs" "alice"
+
+echo "$((total - fail))/$total passed"
+if [ "$fail" != 0 ] && [ -n "${CI:-}" ]; then
+    compose logs --no-color
+fi
+[ "$fail" = 0 ]

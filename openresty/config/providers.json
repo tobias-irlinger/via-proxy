@@ -1,0 +1,86 @@
+{
+  "defaults": {
+    "max_rewrite_bytes": 10485760,
+    "content_types": [
+      "text/html",
+      "application/xhtml+xml",
+      "text/css",
+      "application/javascript",
+      "text/javascript",
+      "application/json"
+    ]
+  },
+  "limits": {
+    "window": 3600,
+    "max_downloads": 150,
+    "max_mb": 2000,
+    "block": 3600,
+    "contact": "Bibliothek, it-bibliothek@example.org"
+  },
+  "providers": [
+    {
+      "id": "doi",
+      "name": "DOI-Resolver",
+      "start": "https://doi.org/",
+      "hosts": [
+        "doi.org",
+        "dx.doi.org"
+      ],
+      "limits": false
+    },
+    {
+      "id": "jstor",
+      "name": "JSTOR",
+      "start": "https://www.jstor.org/",
+      "hosts": [
+        "www.jstor.org",
+        "jstor.org"
+      ]
+    },
+    {
+      "id": "wiley",
+      "name": "Wiley Online Library",
+      "start": "https://onlinelibrary.wiley.com/",
+      "hosts": [
+        "onlinelibrary.wiley.com",
+        ".onlinelibrary.wiley.com"
+      ]
+    },
+    {
+      "id": "sage",
+      "name": "SAGE Journals",
+      "start": "https://journals.sagepub.com/",
+      "hosts": [
+        "journals.sagepub.com"
+      ]
+    },
+    {
+      "id": "brill",
+      "name": "Brill",
+      "start": "https://brill.com/",
+      "hosts": [
+        "brill.com",
+        "scholarlyeditions.brill.com",
+        "referenceworks.brillonline.com"
+      ]
+    },
+    {
+      "id": "nature",
+      "name": "Nature",
+      "start": "https://www.nature.com/",
+      "hosts": [
+        "nature.com",
+        ".nature.com"
+      ]
+    },
+    {
+      "id": "statista",
+      "name": "Statista",
+      "start": "https://www.statista.com/",
+      "hosts": [
+        "www.statista.com"
+      ],
+      "cookies": "host"
+    }
+  ]
+}

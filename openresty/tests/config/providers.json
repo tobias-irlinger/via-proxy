@@ -1,0 +1,41 @@
+{
+  "limits": {
+    "window": 3600,
+    "max_downloads": 3,
+    "max_mb": 1,
+    "block": 120,
+    "contact": "test@example.org"
+  },
+  "providers": [
+    {
+      "id": "publisher",
+      "name": "Example Publisher",
+      "start": "https://www.example-publisher.test/",
+      "hosts": [
+        "www.example-publisher.test",
+        ".example-publisher.test"
+      ],
+      "scheme": "http"
+    },
+    {
+      "id": "strict",
+      "name": "Strict Publisher",
+      "hosts": [
+        "www.strict-publisher.test"
+      ],
+      "scheme": "http",
+      "limits": {
+        "max_downloads": 1
+      }
+    },
+    {
+      "id": "free",
+      "name": "Free Publisher",
+      "hosts": [
+        "www.free-publisher.test"
+      ],
+      "scheme": "http",
+      "limits": false
+    }
+  ]
+}
