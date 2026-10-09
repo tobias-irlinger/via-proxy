@@ -96,7 +96,8 @@ Jeder nginx-Worker prüft die Datei alle `VIA_RELOAD_INTERVAL` Sekunden
 (Standard 5) und lädt sie bei Änderungen neu. Eine fehlerhafte Datei (kaputtes
 JSON, doppelter Host, ungültige `id` …) wird **nicht** übernommen: Die
 bisherige Konfiguration bleibt aktiv, der Fehler steht im Log
-(`via-config: keeping version …`) und unter `/status`. Welche Version aktiv
+(`via-config: keeping version …`) und unter `/status`. Ein *Neustart* mit
+fehlerhafter Datei schlägt dagegen fehl (wie bei jeder nginx-Konfiguration). Welche Version aktiv
 ist, zeigt:
 
 ```sh
@@ -188,6 +189,8 @@ Für mehrere Proxy-Server müsste der Zustand nach Redis.
 | `http://127.0.0.1:8081/health` | nur Server | dasselbe, nutzt der Docker-Healthcheck |
 | `http://127.0.0.1:8081/status` | nur Server | JSON: geladene Konfigurationsversion, Anzahl Anbieter, letzter Ladefehler |
 
+OpenResty startet und lädt neu, auch wenn oauth2-proxy gerade nicht läuft
+(der Name wird erst pro Anfrage aufgelöst); `/health` meldet dann 503.
 `docker compose ps` zeigt den OpenResty-Container erst als `healthy`, wenn auch
 oauth2-proxy bereit ist (OIDC-Discovery am IdP erfolgreich). Das
 oauth2-proxy-Image hat keine Shell für einen eigenen Healthcheck, deshalb prüft
@@ -258,7 +261,7 @@ Proxy auch von privaten Geräten außerhalb des Campus genutzt wird.
 
 ```sh
 tests/unit.sh     # Lua-Unit-Tests (76 Fälle)
-tests/e2e.sh      # kompletter Ablauf mit Docker (60 Fälle), DEBUG=1 für Details
+tests/e2e.sh      # kompletter Ablauf mit Docker (62 Fälle), DEBUG=1 für Details
 tests/acme.sh     # ACME: Ausstellen + Erneuern (18 Fälle), braucht certbot
 ```
 

@@ -122,6 +122,17 @@ served_cert() {
     openssl s_client -connect 127.0.0.1:443 -servername "$1" </dev/null 2>/dev/null |
         openssl x509 -noout -issuer -serial -ext subjectAltName 2>/dev/null
 }
+# "openresty -s reload" returns before the new workers take over; an old
+# worker may still answer the next connection, so wait for the switch
+served_cert_eventually() {   # served_cert_eventually <servername> <expected>
+    local got
+    for _ in $(seq 20); do
+        got=$(served_cert "$1")
+        [ "$got" = "$2" ] && break
+        sleep 0.5
+    done
+    echo "$got"
+}
 
 r=$(curl -s --noproxy '*' --resolve login.proxy.test:80:127.0.0.1 \
     http://login.proxy.test/.well-known/acme-challenge/missing -o /dev/null -w '%{http_code}')
@@ -155,17 +166,18 @@ cert=$(openssl x509 -in "$work/certs/fullchain.pem" -noout -issuer -serial -ext 
 check "certificate issued by the ACME server" has "$cert" "Pebble"
 check "certificate is a wildcard" has "$cert" "DNS:*.proxy.test"
 check "certificate covers the proxy domain" has "$cert" "DNS:proxy.test"
-served=$(served_cert www-example--publisher-test.proxy.test)
+served=$(served_cert_eventually www-example--publisher-test.proxy.test "$cert")
 check "OpenResty serves the new certificate" test "$served" = "$cert"
 
 REQUESTS_CA_BUNDLE=$work/pebble/ca.pem "$CERTBOT" renew --force-renewal --quiet \
+    --dns-rfc2136-propagation-seconds 1 \
     --config-dir "$work/letsencrypt" --work-dir "$work/letsencrypt/work" \
     --logs-dir "$work/letsencrypt/logs"
 check "renewal succeeds" test "$?" = 0
 renewed=$(openssl x509 -in "$work/certs/fullchain.pem" -noout -issuer -serial -ext subjectAltName 2>&1)
 check "renewal replaced the certificate" test "$renewed" != "$cert"
 check "renewed certificate from the ACME server" has "$renewed" "Pebble"
-served=$(served_cert login.proxy.test)
+served=$(served_cert_eventually login.proxy.test "$renewed")
 check "OpenResty serves the renewed certificate" test "$served" = "$renewed"
 r=$(curl -s --noproxy '*' http://127.0.0.1:8081/health)
 check "proxy healthy after renewal" test "$r" = ok

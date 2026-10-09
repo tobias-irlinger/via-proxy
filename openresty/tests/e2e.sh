@@ -233,6 +233,7 @@ for i in 1 2 3 4; do
     r=$(c -o /dev/null -w '%{http_code} %{redirect_url}' "https://login.proxy.test/login?url=https://www.extra.test/x")
     check "new provider active after reload ($i)" has "$r" "302 https://www-extra-test.proxy.test/x"
 done
+cp "$work/config/providers.json" "$work/providers.good.json"
 echo '{ broken' > "$work/config/providers.json.tmp"
 mv "$work/config/providers.json.tmp" "$work/config/providers.json"
 sleep 2
@@ -241,6 +242,25 @@ check "broken file keeps old config" has "$r" "\"version\":\"$new_version\""
 check "broken file reported in status" has "$r" "cannot parse"
 r=$(c -o /dev/null -w '%{http_code}' "https://login.proxy.test/login?url=https://www.extra.test/")
 check "proxy keeps working with broken file" has "$r" "302"
+
+# OpenResty must start (and reload) while oauth2-proxy is down
+# (with a valid config again: a broken providers.json blocks the start)
+cp "$work/providers.good.json" "$work/config/providers.json"
+compose stop oauth2-proxy >/dev/null 2>&1
+compose restart openresty >/dev/null 2>&1
+for _ in $(seq 30); do
+    code=$(admin -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/health)
+    [ "$code" = 503 ] && break
+    sleep 1
+done
+check "starts without oauth2-proxy, /health 503" has "$code" "503"
+compose start oauth2-proxy >/dev/null 2>&1
+for _ in $(seq 60); do
+    r=$(admin http://127.0.0.1:8081/health)
+    [ "$r" = ok ] && break
+    sleep 1
+done
+check "recovers when oauth2-proxy is back" test "$r" = ok
 
 logs=$(compose logs openresty 2>/dev/null)
 check "block is logged with pseudonym" has "$logs" "via-limit: user $user blocked"
